@@ -8,10 +8,12 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
 
 	_ "github.com/jackc/pgx/v4/stdlib"
 )
@@ -32,14 +34,14 @@ func getRating(c *gin.Context) {
 	lastName := c.Query("lastName")
 
 	go func() {
-		resp, err := http.Get("http://54.193.122.205/rate?firstName=" + firstName + "&lastName=" + lastName)
+		resp, err := http.Get("http://" + os.Getenv("SCRAPER") + "/rate?firstName=" + firstName + "&lastName=" + lastName)
 		if err != nil {
-			log.Fatalln(err)
+			log.Println("Failed to query scraper", err)
 		}
 		//We Read the response body on the line below.
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			log.Fatalln(err)
+			log.Println("Failed to parse response body: ", err)
 		}
 		//Convert the body to type string
 		sb := string(body)
@@ -50,17 +52,11 @@ func getRating(c *gin.Context) {
 	go func() {
 
 		row := globalDb.QueryRowContext(context.Background(), "SELECT rating, date from ratings WHERE firstName = $1 AND lastName = $2", firstName, lastName)
-		// if err != nil {
-		// 	fmt.Println("db.QueryRowContext", err)
-		// 	dbCacheChannel <- 0
-		// 	dbLastCheckedChannel <- time.Unix(0, 0)
-		// 	return
-		// }
 		var rating float64
 		var date string
 
 		if err := row.Scan(&rating, &date); err != nil {
-			fmt.Println("row.Scan", err)
+			log.Println("row.Scan", err)
 			dbCacheChannel <- 0
 			dbLastCheckedChannel <- time.Unix(0, 0)
 			return
@@ -69,7 +65,7 @@ func getRating(c *gin.Context) {
 		dbCacheChannel <- rating
 		dbLastChecked, err := time.Parse(time.RFC3339Nano, date)
 		if err != nil {
-			fmt.Println("parsing error")
+			log.Println("time.Parse", err)
 			dbCacheChannel <- 0
 			dbLastCheckedChannel <- time.Unix(0, 0)
 			return
@@ -82,7 +78,6 @@ func getRating(c *gin.Context) {
 	dbLastCheckedResult := <-dbLastCheckedChannel
 
 	if !dbLastCheckedResult.AddDate(0, 0, 1).Before(time.Now()) {
-		fmt.Println("db is new enough to return")
 		c.IndentedJSON(http.StatusOK, dbCacheResult)
 		go func() {
 			scrapeResult := <-scraperChannel
@@ -92,7 +87,6 @@ func getRating(c *gin.Context) {
 	}
 
 	scrapeResult := <-scraperChannel
-	fmt.Println("db is not new enough to return")
 	// If by some miracle scrapeResult actually returns first, then there's no need to wait for the DB cache because we just want the most up to date
 	c.IndentedJSON(http.StatusOK, scrapeResult)
 	go func() {
@@ -103,11 +97,17 @@ func getRating(c *gin.Context) {
 
 func main() {
 
+	err := godotenv.Load(".env")
+
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+
 	dsn := url.URL{
-		Host:   "localhost:5432",
-		Path:   "postgres",
-		User:   url.UserPassword("postgres", "12345"),
-		Scheme: "postgres",
+		Host:   os.Getenv("HOST") + ":" + os.Getenv("PORT"),
+		Path:   os.Getenv("DBPATH"),
+		User:   url.UserPassword(os.Getenv("DBUSERNAME"), os.Getenv("DBPASSWORD")),
+		Scheme: os.Getenv("SCHEME"),
 	}
 
 	q := dsn.Query()
@@ -118,18 +118,15 @@ func main() {
 	db, err := sql.Open("pgx", dsn.String())
 
 	if err != nil {
-		fmt.Println("sql.Open", err)
-		return
+		log.Fatal("Connection failed to open", err)
 	}
 
 	defer func() {
 		db.Close()
-		fmt.Println("closed")
 	}()
 
 	if err := db.PingContext(context.Background()); err != nil {
-		fmt.Println("ping db failed")
-		return
+		log.Fatal("DB failed to connect: ", err)
 	}
 	globalDb = db
 	router := gin.Default()
