@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -12,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 
@@ -21,8 +21,11 @@ import (
 var globalDb *sql.DB
 
 func updateDb(firstName string, lastName string, rating float64) {
-	fmt.Println("update db with: ", firstName, lastName, rating)
-	globalDb.QueryRowContext(context.Background(), "INSERT into ratings VALUES($1,$2,$3) ON CONFLICT (firstName, lastName) DO UPDATE SET date = EXCLUDED.date;", firstName, lastName, rating)
+	row := globalDb.QueryRowContext(context.Background(), "INSERT into ratings VALUES($1,$2,$3) ON CONFLICT (firstName, lastName) DO UPDATE SET date = EXCLUDED.date;", firstName, lastName, rating)
+	err := row.Scan()
+	if err != nil {
+		log.Println("Insertion failed: ", err)
+	}
 }
 
 func getRating(c *gin.Context) {
@@ -35,17 +38,21 @@ func getRating(c *gin.Context) {
 
 	go func() {
 		resp, err := http.Get("http://" + os.Getenv("SCRAPER") + "/rate?firstName=" + firstName + "&lastName=" + lastName)
+
 		if err != nil {
 			log.Println("Failed to query scraper", err)
 		}
-		//We Read the response body on the line below.
+
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			log.Println("Failed to parse response body: ", err)
 		}
-		//Convert the body to type string
+
 		sb := string(body)
 		rating, err := strconv.ParseFloat(sb, 64)
+		if err != nil {
+			log.Println("Failed to parse string to float: ", err)
+		}
 		scraperChannel <- rating
 	}()
 
@@ -57,8 +64,8 @@ func getRating(c *gin.Context) {
 
 		if err := row.Scan(&rating, &date); err != nil {
 			log.Println("row.Scan", err)
-			dbCacheChannel <- 0
-			dbLastCheckedChannel <- time.Unix(0, 0)
+			close(dbCacheChannel)
+			close(dbLastCheckedChannel)
 			return
 		}
 
@@ -66,8 +73,8 @@ func getRating(c *gin.Context) {
 		dbLastChecked, err := time.Parse(time.RFC3339Nano, date)
 		if err != nil {
 			log.Println("time.Parse", err)
-			dbCacheChannel <- 0
-			dbLastCheckedChannel <- time.Unix(0, 0)
+			close(dbCacheChannel)
+			close(dbLastCheckedChannel)
 			return
 		}
 		dbLastCheckedChannel <- dbLastChecked
@@ -77,8 +84,8 @@ func getRating(c *gin.Context) {
 	dbCacheResult := <-dbCacheChannel
 	dbLastCheckedResult := <-dbLastCheckedChannel
 
-	if !dbLastCheckedResult.AddDate(0, 0, 1).Before(time.Now()) {
-		c.IndentedJSON(http.StatusOK, dbCacheResult)
+	if !dbLastCheckedResult.AddDate(0, 0, 5).Before(time.Now()) {
+		c.JSON(http.StatusOK, dbCacheResult)
 		go func() {
 			scrapeResult := <-scraperChannel
 			updateDb(firstName, lastName, scrapeResult)
@@ -87,8 +94,7 @@ func getRating(c *gin.Context) {
 	}
 
 	scrapeResult := <-scraperChannel
-	// If by some miracle scrapeResult actually returns first, then there's no need to wait for the DB cache because we just want the most up to date
-	c.IndentedJSON(http.StatusOK, scrapeResult)
+	c.JSON(http.StatusOK, scrapeResult)
 	go func() {
 		updateDb(firstName, lastName, scrapeResult)
 	}()
@@ -104,10 +110,10 @@ func main() {
 	}
 
 	dsn := url.URL{
-		Host:   os.Getenv("HOST") + ":" + os.Getenv("PORT"),
-		Path:   os.Getenv("DBPATH"),
-		User:   url.UserPassword(os.Getenv("DBUSERNAME"), os.Getenv("DBPASSWORD")),
-		Scheme: os.Getenv("SCHEME"),
+		Host:   os.Getenv("GOHOST") + ":" + os.Getenv("GOPORT"),
+		Path:   os.Getenv("GODBPATH"),
+		User:   url.UserPassword(os.Getenv("GODBUSERNAME"), os.Getenv("GODBPASSWORD")),
+		Scheme: os.Getenv("GOSCHEME"),
 	}
 
 	q := dsn.Query()
@@ -130,6 +136,7 @@ func main() {
 	}
 	globalDb = db
 	router := gin.Default()
-	router.GET("/rating", getRating)
-	router.Run("localhost:8080")
+	router.Use(cors.Default())
+	router.GET("/rate", getRating)
+	router.Run("localhost:5001")
 }
